@@ -1,0 +1,17 @@
+[project]
+name = "blaz4r"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "astropy>=7.2.0",
+    "astroquery>=0.4.11",
+    "beautifulsoup4>=4.14.3",
+    "lxml>=6.1.0",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.5",
+    "pandas>=3.0.3",
+    "requests>=2.34.2",
+    "scipy>=1.17.1",
+]
