@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
-"""Plot Gemini GNIRS ITC final S/N curves for 30/60/90 exposures.
-
-Expected input folder structure is the one produced by run_gnirs_itc_batch_v5.py:
-
-  gnirs_itc_outputs/
-    <target>/
-      nexp_030/
-        final_s2n_ascii.txt
-        payload.json
-      nexp_060/
-        final_s2n_ascii.txt
-        payload.json
-      nexp_090/
-        final_s2n_ascii.txt
-        payload.json
-
-For each target, this script creates one wavelength(nm)-S/N plot with all
-available 30/60/90 exposure curves. It marks the Mg II line wavelength,
-highlights the Mg II FWHM wavelength interval, and draws/labels the median
-S/N inside the FWHM interval for each exposure count.
-"""
+# Gemini GNIRS ITC 최종 S/N 곡선을 그린다.
+# S/N 중앙값 정의는 README.md에 정리되어 있다.
 
 from __future__ import annotations
 
@@ -38,7 +19,7 @@ import numpy as np
 C_KM_S = 299_792.458
 EXPECTED_EXPOSURES = (30, 60, 90)
 
-# Explicit colors requested by user: 30/60/90 must be visually distinguishable.
+# 사용자가 요청한 명시적 색상. 30/60/90 exposure 곡선이 구분되어야 한다.
 CURVE_STYLES = {
     30: {"color": "tab:blue", "linestyle": "-", "label": "30 exp"},
     60: {"color": "tab:orange", "linestyle": "-", "label": "60 exp"},
@@ -58,7 +39,7 @@ class SnrRun:
 
     @property
     def fwhm_width_nm(self) -> float:
-        # Velocity width to wavelength FWHM: Δλ = λ * v / c.
+        # 속도폭을 파장폭으로 변환한다.
         return self.line_center_nm * self.fwhm_km_s / C_KM_S
 
     @property
@@ -70,17 +51,19 @@ class SnrRun:
         return self.line_center_nm + 0.5 * self.fwhm_width_nm
 
     def snr_at_line_center(self) -> float:
-        # Use nearest ITC wavelength sample to the requested Mg II line center.
+        # 선 중심에 가장 가까운 파장 격자의 S/N을 쓴다.
         idx = int(np.nanargmin(np.abs(self.wavelength_nm - self.line_center_nm)))
         return float(self.snr[idx])
 
     def median_snr_within_fwhm(self) -> float:
+        # Mg II FWHM 구간 안의 S/N 중앙값을 계산한다.
         mask = (self.wavelength_nm >= self.fwhm_lower_nm) & (self.wavelength_nm <= self.fwhm_upper_nm)
         if not np.any(mask):
             return float("nan")
         return float(np.nanmedian(self.snr[mask]))
 
     def min_snr_within_fwhm(self) -> float:
+        # 보조 진단용 최소 S/N.
         mask = (self.wavelength_nm >= self.fwhm_lower_nm) & (self.wavelength_nm <= self.fwhm_upper_nm)
         if not np.any(mask):
             return float("nan")
@@ -88,14 +71,7 @@ class SnrRun:
 
 
 def read_ascii_two_columns(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Read ITC ASCII data with comment lines and two numeric columns.
-
-    The ITC ASCII files normally have rows like:
-        # ITC Data: ...
-        1419.160  0.000
-        1419.645  0.000
-    where column 1 is wavelength in nm and column 2 is S/N for FinalS2NData.
-    """
+    # ITC ASCII의 wavelength와 S/N 두 열을 읽는다.
     xs: list[float] = []
     ys: list[float] = []
     with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -120,7 +96,7 @@ def read_ascii_two_columns(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def read_payload(path: Path) -> tuple[float, float, int | None]:
-    """Return Mg II line center in nm, FWHM in km/s, and numExpA from payload."""
+    # payload에서 Mg II 중심 파장[nm], FWHM[km/s], 노출 횟수를 읽는다.
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
 
@@ -152,7 +128,7 @@ def discover_runs(root: Path, wanted_exposures: Iterable[int]) -> dict[str, list
         raise FileNotFoundError(f"ITC output root does not exist: {root}")
 
     for target_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        # Skip debug folders produced by previous ITC scripts.
+        # 이전 ITC script가 만든 debug folder는 대상으로 보지 않는다.
         if target_dir.name.startswith("itc_debug"):
             continue
         target = target_dir.name
@@ -201,8 +177,7 @@ def plot_target(target: str, runs: list[SnrRun], output_dir: Path, window_factor
     if not runs:
         return []
 
-    # Use the first run as the authoritative line/FWHM definition. All nexp runs
-    # should have the same Mg II setup because they are the same target.
+    # 같은 대상의 노출별 run은 동일한 Mg II 설정을 쓴다.
     line_center = runs[0].line_center_nm
     fwhm_lower = runs[0].fwhm_lower_nm
     fwhm_upper = runs[0].fwhm_upper_nm
@@ -213,7 +188,7 @@ def plot_target(target: str, runs: list[SnrRun], output_dir: Path, window_factor
 
     fig, ax = plt.subplots(figsize=(9.0, 5.0), constrained_layout=True)
 
-    # Mg II FWHM interval; drawn first so curves sit on top.
+    # Mg II FWHM 구간을 먼저 그려서 S/N 곡선이 위에 올라오도록 한다.
     ax.axvspan(fwhm_lower, fwhm_upper, color="0.85", alpha=0.55, label="Mg II FWHM range")
     ax.axvline(line_center, color="black", linewidth=1.2, linestyle="--", label="Mg II line center")
 
@@ -240,7 +215,7 @@ def plot_target(target: str, runs: list[SnrRun], output_dir: Path, window_factor
         center_snr = run.snr_at_line_center()
         ymax_candidates.extend([float(np.nanmax(run.snr[mask_plot])), med])
 
-        # Highlight median S/N within FWHM as a colored horizontal segment.
+        # FWHM 내부 S/N 중앙값을 같은 색의 수평 점선으로 표시한다.
         if math.isfinite(med):
             ax.hlines(
                 med,
@@ -273,7 +248,7 @@ def plot_target(target: str, runs: list[SnrRun], output_dir: Path, window_factor
     ax.set_ylabel("S/N")
     ax.set_title(f"{target}: Gemini/GNIRS ITC Final S/N near Mg II")
 
-    # Text box: median S/N inside FWHM for each exposure count.
+    # 노출별 FWHM 내부 S/N 중앙값을 그림 안쪽 text box에 적는다.
     med_lines = []
     for row in summary_rows:
         med = row["median_snr_within_fwhm"]

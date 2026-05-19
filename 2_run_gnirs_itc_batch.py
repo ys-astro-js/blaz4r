@@ -1,26 +1,5 @@
-"""Batch-submit Gemini GNIRS ITC calculations from prepared BLAZ4R CSV rows.
-
-Input CSV columns expected:
-- name
-- z
-- RA J2000
-- Dec J2000
-- ITC point source spatially integrated brightness [AB mag]
-- ITC point source brightness band
-- ITC spectral distribution line wavelength [micron]
-- ITC line flux [erg/s/cm^2]
-- ITC line width FWHM [km/s]
-- ITC continuum flux density [erg/s/cm^2/A]
-
-Run:
-    uv add pandas requests beautifulsoup4 lxml
-    uv run python run_gnirs_itc_batch_v5.py
-
-This version intentionally keeps Mg II line flux and continuum in cgs units,
-sets spectroscopy output to Autoscale while still sending the required numeric
-plotWavelengthL/U parameters, and uses a non-zero slit offset so GNIRS slit
-spectroscopy is calculated with the ABBA offset assumption.
-"""
+# 준비된 CSV 입력값으로 Gemini GNIRS ITC를 일괄 실행한다.
+# 입력값의 물리 가정과 실행 순서는 README.md에 정리되어 있다.
 
 from __future__ import annotations
 
@@ -42,6 +21,7 @@ ITC_URL = "https://itc.gemini.edu/itc/servlets/web/ITCgnirs.html"
 DEFAULT_INPUT_CSV = Path("itc-inputs.csv")
 DEFAULT_OUTDIR = Path("gnirs_itc_outputs")
 DEFAULT_SUMMARY_CSV = Path("gnirs_itc_batch_summary.csv")
+SAMPLE_CHOICES = ("confirmed", "candidates", "all")
 
 EXPOSURE_COUNTS = [30, 60, 90]
 COADDS = 1
@@ -51,31 +31,40 @@ REQUEST_SLEEP_SEC = 1.0
 TIMEOUT_SEC = 90
 DEFAULT_DITHER_SIZE_ARCSEC = 5.0
 
-# Fixed GNIRS setup requested by the user. Unit-like select values are resolved
-# dynamically from the live form when possible, because Gemini ITC select values
-# can be implementation-specific.
+# Gemini ITC 입력 화면의 현재 cgs 단위 선택값.
+ITC_CGS_LINE_FLUX_UNIT = "ergs_flux"
+ITC_CGS_CONTINUUM_UNIT = "ergs_fd_wavelength"
+
+# GNIRS long-slit J/H/K 분광 가능 범위 [micron].
+GNIRS_SPECTROSCOPY_WINDOWS_UM = {
+    "J": (1.17, 1.37),
+    "H": (1.47, 1.80),
+    "K": (1.91, 2.49),
+}
+
+# 고정 GNIRS 설정. 일부 선택값은 현재 입력 화면에서 다시 확인한다.
 ITC_FIXED_VALUES = {
     "Instrument": "GNIRS",
     "Profile": "POINT",
     "Distribution": "ELINE",
     "Recession": "REDSHIFT",
-    # The CSV wavelength is already observed-frame; z=0 prevents double redshifting.
+    # CSV 파장은 이미 관측 파장이므로 ITC redshift는 0으로 둔다.
     "z": "0",
     "v": "0.0",
     "PixelScale": "PS_015",       # 0.15 arcsec/pix
-    "SlitWidth": "SW_6",          # 0.675 arcsec slit, checked against option text when possible
+    "SlitWidth": "SW_6",          # 0.675 arcsec slit. 가능하면 option text로 재확인한다.
     "Disperser": "D_32",          # 32 l/mm
     "CrossDispersed": "NO",
     "Filter": "spectroscopy",
-    "ReadMode": "VERY_FAINT",     # Very Faint Objects
+    "ReadMode": "VERY_FAINT",     # Very Faint Objects 모드
     "WellDepth": "SHALLOW",
     "Coating": "SILVER",
     "IssPort": "SIDE_LOOKING",
     "Type": "PWFS",
     "FieldLens": "OUT",
     "GuideStarType": "NGS",
-    "ImageQuality": "PERCENT_85", # IQ85 / Poor
-    "CloudCover": "PERCENT_70",   # CC70 / Cirrus
+    "ImageQuality": "PERCENT_85", # IQ85 / Poor 조건
+    "CloudCover": "PERCENT_70",   # CC70 / Cirrus 조건
     "WaterVapor": "ANY",
     "SkyBackground": "ANY",
     "Airmass": "1.5",
@@ -84,9 +73,9 @@ ITC_FIXED_VALUES = {
     "expTimeA": str(EXPOSURE_TIME_SEC),
     "fracOnSourceA": f"{FRACTION_ON_SOURCE:g}",
     "analysisMethod": "autoAper",
-    # Spectroscopy output should be Autoscale, not user-plotted wavelength range.
+    # S/N ASCII 파일은 후처리에서 직접 읽는다.
     "PlotLimits": "AUTO",
-    # Keep point-source normalization in Jy to avoid Vega/AB ambiguity in older ITC forms.
+    # AB magnitude 대신 Jy 값으로 넣어 등급 체계 혼동을 줄인다.
     "psSourceUnits": "JY",
 }
 
@@ -107,6 +96,7 @@ REQUIRED_COLUMNS = [
 class Target:
     name: str
     z: float
+    blazar_class: str
     ra: str
     dec: str
     brightness_ab_mag: float
@@ -127,7 +117,7 @@ def finite_float(value: object) -> float | None:
 
 
 def abmag_to_jy(m_ab: float) -> float:
-    # AB definition: f_nu[Jy] = 3631 * 10^(-0.4 m_AB)
+    # AB 정의: f_nu[Jy] = 3631 * 10^(-0.4 m_AB)
     return 3631.0 * 10.0 ** (-0.4 * m_ab)
 
 
@@ -156,10 +146,10 @@ def get_select_options(form, name: str) -> list[dict[str, str]]:
 
 
 def select_option_value(form, name: str, include_all: list[str], fallback: str) -> str:
-    """Find a select option by visible text; fall back to known historical values."""
+    # 보이는 이름 또는 HTML value에서 원하는 선택지를 찾는다.
     includes = [norm_text(x) for x in include_all]
     for opt in get_select_options(form, name):
-        t = norm_text(opt["text"])
+        t = norm_text(f"{opt['text']} {opt['value']}")
         if all(x in t for x in includes):
             return opt["value"]
     return fallback
@@ -173,14 +163,46 @@ def select_option_by_text_or_value(form, name: str, wanted_text: str, fallback: 
     return fallback
 
 
-def load_targets(path: Path) -> list[Target]:
+def wavelength_in_band(line_wavelength_um: float, band: str) -> bool:
+    # line_wavelength_um이 특정 GNIRS spectroscopy window 안에 있는지 확인한다.
+    window = GNIRS_SPECTROSCOPY_WINDOWS_UM.get(band)
+    if window is None:
+        return False
+    lo, hi = window
+    return lo <= line_wavelength_um <= hi
+
+
+def spectroscopy_window_band(line_wavelength_um: float) -> str | None:
+    # line_wavelength_um이 들어가는 GNIRS J/H/K spectroscopy window를 찾는다.
+    for band in GNIRS_SPECTROSCOPY_WINDOWS_UM:
+        if wavelength_in_band(line_wavelength_um, band):
+            return band
+    return None
+
+
+def include_row_for_sample(row: pd.Series, sample: str) -> bool:
+    if "blazar_class" not in row.index or sample == "all":
+        return True
+    blazar_class = str(row.get("blazar_class", "")).strip().lower()
+    if sample == "confirmed":
+        return blazar_class == "y"
+    if sample == "candidates":
+        return blazar_class == "c"
+    raise ValueError(f"Unknown sample selection: {sample}")
+
+
+def load_targets(path: Path, sample: str = "confirmed") -> list[Target]:
     df = pd.read_csv(path)
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"입력 CSV에 필요한 열이 없습니다: {missing}")
 
     targets: list[Target] = []
+    skip_reasons: dict[str, int] = {}
     for _, row in df.iterrows():
+        if not include_row_for_sample(row, sample):
+            skip_reasons[f"outside {sample} sample"] = skip_reasons.get(f"outside {sample} sample", 0) + 1
+            continue
         vals = {
             "brightness": finite_float(row["ITC point source spatially integrated brightness [AB mag]"]),
             "line_wave": finite_float(row["ITC spectral distribution line wavelength [micron]"]),
@@ -189,25 +211,36 @@ def load_targets(path: Path) -> list[Target]:
             "continuum": finite_float(row["ITC continuum flux density [erg/s/cm^2/A]"]),
         }
         if any(v is None for v in vals.values()):
+            skip_reasons["missing numeric ITC input"] = skip_reasons.get("missing numeric ITC input", 0) + 1
             continue
         band = str(row["ITC point source brightness band"]).strip().upper()
         if band not in {"J", "H", "K"}:
+            skip_reasons["invalid brightness band"] = skip_reasons.get("invalid brightness band", 0) + 1
+            continue
+        line_wave = float(vals["line_wave"])
+        if spectroscopy_window_band(line_wave) is None:
+            skip_reasons["line wavelength outside GNIRS spectroscopy windows"] = (
+                skip_reasons.get("line wavelength outside GNIRS spectroscopy windows", 0) + 1
+            )
             continue
         targets.append(
             Target(
                 name=str(row["name"]).strip(),
                 z=float(row["z"]),
+                blazar_class=str(row.get("blazar_class", "")).strip(),
                 ra=str(row["RA J2000"]).strip(),
                 dec=str(row["Dec J2000"]).strip(),
                 brightness_ab_mag=float(vals["brightness"]),
                 brightness_band=band,
-                line_wavelength_um=float(vals["line_wave"]),
+                line_wavelength_um=line_wave,
                 line_flux_erg_s_cm2=float(vals["line_flux"]),
                 line_width_km_s=float(vals["line_width"]),
                 continuum_erg_s_cm2_a=float(vals["continuum"]),
                 notes=str(row.get("notes/cautions", "")),
             )
         )
+    for reason, count in sorted(skip_reasons.items()):
+        print(f"[skip input] {count} rows: {reason}")
     return targets
 
 
@@ -271,11 +304,11 @@ def dump_form_fields(form, path: Path) -> None:
 
 
 def dynamic_select_overrides(form) -> dict[str, str]:
-    """Resolve select values from visible labels where exact ITC values are not guaranteed."""
+    # Gemini ITC 입력 화면에서 단위/설정 선택값을 찾는다.
     return {
-        # Line flux and continuum must remain in the CSV cgs units, not W/m2 units.
-        "lineFluxUnits": select_option_value(form, "lineFluxUnits", ["erg", "cm2"], "cgs_flux"),
-        "lineContinuumUnits": select_option_value(form, "lineContinuumUnits", ["erg", "cm2", "A"], "cgs_fd_wavelength"),
+        # 선 세기와 연속광은 CSV의 cgs 단위를 유지한다.
+        "lineFluxUnits": select_option_value(form, "lineFluxUnits", ["erg", "flux"], ITC_CGS_LINE_FLUX_UNIT),
+        "lineContinuumUnits": select_option_value(form, "lineContinuumUnits", ["erg", "fd", "wavelength"], ITC_CGS_CONTINUUM_UNIT),
         "PlotLimits": select_option_by_text_or_value(form, "PlotLimits", "Autoscale", "AUTO"),
         "SlitWidth": select_option_by_text_or_value(form, "SlitWidth", "0.675", "SW_6"),
         "ReadMode": select_option_by_text_or_value(form, "ReadMode", "Very Faint", "VERY_FAINT"),
@@ -287,11 +320,11 @@ def configure_payload(target: Target, n_exp: int, base: dict[str, str], select_o
     p.update(ITC_FIXED_VALUES)
     p.update(select_overrides)
 
-    # Point-source spatial normalization: use Jy converted from AB magnitude to avoid old-form Vega/AB ambiguity.
+    # 점광원 밝기는 Jy 단위로 넣는다.
     p["psSourceNorm"] = f"{abmag_to_jy(target.brightness_ab_mag):.8e}"
     p["WavebandDefinition"] = target.brightness_band
 
-    # Single-emission-line SED. Values intentionally stay in cgs units.
+    # Mg II 선과 연속광 입력값은 앞 단계 CSV의 값을 그대로 사용한다.
     p["lineWavelength"] = f"{target.line_wavelength_um:.7f}"
     p["instrumentCentralWavelength"] = f"{target.line_wavelength_um:.7f}"
     p["lineFlux"] = f"{target.line_flux_erg_s_cm2:.8e}"
@@ -303,12 +336,10 @@ def configure_payload(target: Target, n_exp: int, base: dict[str, str], select_o
     p["expTimeA"] = str(int(EXPOSURE_TIME_SEC))
     p["fracOnSourceA"] = f"{FRACTION_ON_SOURCE:g}"
 
-    # Non-zero slit dither size; Gemini ITC help says slit spectroscopy assumes ABBA offsets.
+    # slit spectroscopy의 위치 이동 관측을 반영한다.
     p["offset"] = f"{dither_size:g}"
 
-    # Autoscale output still requires numeric plotWavelengthL/U parameters on the server.
-    # They are ignored when PlotLimits=Autoscale, but omitting them triggers
-    # "Missing 'plotWavelengthL' double parameter".
+    # Autoscale이어도 Gemini server가 plot range 숫자 필드를 요구한다.
     p["PlotLimits"] = select_overrides.get("PlotLimits", "AUTO")
     width_um = 0.02
     p["plotWavelengthL"] = f"{max(0.80, target.line_wavelength_um - width_um):.6f}"
@@ -335,6 +366,8 @@ def validate_payload(payload: dict[str, str], target: Target, n_exp: int, dither
         "Filter": "spectroscopy",
         "CrossDispersed": "NO",
         "offset": f"{dither_size:g}",
+        "lineFluxUnits": ITC_CGS_LINE_FLUX_UNIT,
+        "lineContinuumUnits": ITC_CGS_CONTINUUM_UNIT,
     }
     for key, value in expected.items():
         if payload.get(key) != value:
@@ -343,10 +376,17 @@ def validate_payload(payload: dict[str, str], target: Target, n_exp: int, dither
     if payload.get("PlotLimits") not in {"AUTO", "Autoscale", "auto", "autoscale"}:
         warnings.append(f"PlotLimits={payload.get('PlotLimits')!r}; expected Autoscale/AUTO")
 
-    if "watt" in payload.get("lineFluxUnits", "").lower():
-        warnings.append(f"lineFluxUnits={payload.get('lineFluxUnits')!r}; expected cgs erg/s/cm^2 unit")
-    if "watt" in payload.get("lineContinuumUnits", "").lower():
-        warnings.append(f"lineContinuumUnits={payload.get('lineContinuumUnits')!r}; expected cgs erg/s/cm^2/A unit")
+    line_window = spectroscopy_window_band(target.line_wavelength_um)
+    if line_window is None:
+        warnings.append(
+            f"lineWavelength={target.line_wavelength_um:.7f} micron is outside "
+            "GNIRS J/H/K spectroscopy windows"
+        )
+    elif line_window != target.brightness_band:
+        warnings.append(
+            f"brightness normalization uses {target.brightness_band}-band while "
+            f"Mg II falls in the GNIRS {line_window}-band spectroscopy window"
+        )
 
     for key in ["lineWavelength", "lineFlux", "lineWidth", "lineContinuum"]:
         try:
@@ -361,7 +401,7 @@ def validate_payload(payload: dict[str, str], target: Target, n_exp: int, dither
 
 
 def looks_like_numeric_ascii(text: str, min_rows: int = 5) -> bool:
-    """Return True when the downloaded text looks like ITC numeric ASCII data."""
+    # 다운로드한 텍스트가 ITC numeric ASCII처럼 보이면 True를 반환한다.
     numeric_rows = 0
     for line in text.splitlines():
         line = line.strip()
@@ -381,18 +421,11 @@ def looks_like_numeric_ascii(text: str, min_rows: int = 5) -> bool:
 
 
 def save_itc_ascii_artifacts(session: requests.Session, html: str, base_url: str, run_dir: Path, save_html_tables: bool = False) -> dict[str, str]:
-    """Save exactly the four spectroscopy ASCII datasets linked by Gemini ITC.
-
-    The result page exposes four links through /itc/servlet/images?type=txt:
-    SignalData, BackgroundData, SingleS2NData, and FinalS2NData.  The URL path
-    basename is always "images", so the filename must be taken from the query
-    parameter, not from the path.  Otherwise every file gets mislabeled as
-    images.txt.
-    """
+    # Gemini ITC 결과 페이지의 spectroscopy ASCII 네 종류를 저장한다.
     saved: dict[str, str] = {}
     soup = BeautifulSoup(html, "lxml")
 
-    # Keep server-side diagnostic <pre> blocks only when they actually exist.
+    # server 쪽 diagnostic <pre> block이 실제로 있을 때만 보존한다.
     for i, pre in enumerate(soup.find_all("pre"), 1):
         text = pre.get_text("\n")
         if text.strip():
@@ -436,8 +469,7 @@ def save_itc_ascii_artifacts(session: requests.Session, html: str, base_url: str
             saved[f"{filename_key}_download_error"] = repr(exc)
             continue
 
-        # The ITC text files are plain numeric ASCII.  Store only if the content
-        # passes a weak numeric sanity check; otherwise preserve as a debug file.
+        # 숫자 파일처럼 보이면 정식 산출물로 저장하고, 아니면 debug file로 둔다.
         text = r.text
         path = run_dir / out_name
         if looks_like_numeric_ascii(text):
@@ -497,6 +529,7 @@ def submit_one(session: requests.Session, target: Target, n_exp: int, outdir: Pa
     return {
         "name": target.name,
         "z": str(target.z),
+        "blazar_class": target.blazar_class,
         "RA J2000": target.ra,
         "Dec J2000": target.dec,
         "n_exposures": str(int(n_exp)),
@@ -535,6 +568,7 @@ def main() -> None:
     parser.add_argument("--summary", default=str(DEFAULT_SUMMARY_CSV))
     parser.add_argument("--dump-form", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--sample", choices=SAMPLE_CHOICES, default="confirmed")
     parser.add_argument("--dither-size", type=float, default=DEFAULT_DITHER_SIZE_ARCSEC)
     parser.add_argument("--save-html-tables", action="store_true", help="Save HTML summary tables as debug files; off by default because these are not ASCII spectra.")
     args = parser.parse_args()
@@ -544,7 +578,7 @@ def main() -> None:
     summary_csv = Path(args.summary)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    targets = load_targets(input_csv)
+    targets = load_targets(input_csv, sample=args.sample)
     if args.limit is not None:
         targets = targets[: args.limit]
     if not targets:

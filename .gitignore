@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+gnirs_itc_outputs/
+gnirs_itc_snr_plots/
+gnirs_itc_batch_summary.csv
